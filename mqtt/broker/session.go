@@ -27,6 +27,18 @@ func (b *Broker) CreateSession(clientID string, version byte, opts session.Optio
 	defer b.sessionLocks.Unlock(clientID)
 
 	ctx := context.Background()
+	releaseOwnershipOnFailure := false
+	sessionReady := false
+	defer func() {
+		if !releaseOwnershipOnFailure || sessionReady || b.cluster == nil {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer cancel()
+		if err := b.cluster.ReleaseSession(cleanupCtx, clientID); err != nil {
+			b.logError("cluster_release_session_after_create_failure", err, slog.String("client_id", clientID))
+		}
+	}()
 
 	// Check if session is owned by another node in the cluster
 	var takeoverState *clusterv1.SessionState
@@ -55,6 +67,7 @@ func (b *Broker) CreateSession(clientID string, version byte, opts session.Optio
 			}
 
 			b.telemetry.logger.Info("session takeover completed", slog.String("client_id", clientID))
+			releaseOwnershipOnFailure = true
 
 			// Webhook: session takeover
 			if b.telemetry.webhooks != nil {
@@ -76,6 +89,12 @@ func (b *Broker) CreateSession(clientID string, version byte, opts session.Optio
 	}
 
 	if existing != nil {
+		if b.cluster != nil {
+			if err := b.cluster.AcquireSession(ctx, clientID, b.cluster.NodeID()); err != nil {
+				return nil, false, fmt.Errorf("failed to acquire session ownership: %w", err)
+			}
+		}
+		sessionReady = true
 		return existing, false, nil
 	}
 
@@ -169,7 +188,12 @@ func (b *Broker) CreateSession(clientID string, version byte, opts session.Optio
 		b.handleDisconnect(s, graceful)
 	})
 
-	b.sessionsMap.Set(clientID, s)
+	if b.cluster != nil {
+		if err := b.cluster.AcquireSession(ctx, clientID, b.cluster.NodeID()); err != nil {
+			return nil, false, fmt.Errorf("failed to acquire session ownership: %w", err)
+		}
+		releaseOwnershipOnFailure = true
+	}
 
 	if b.stores.sessions != nil {
 		if err := b.stores.sessions.Save(s.Info()); err != nil {
@@ -177,13 +201,8 @@ func (b *Broker) CreateSession(clientID string, version byte, opts session.Optio
 		}
 	}
 
-	if b.cluster != nil {
-		ctx := context.Background()
-		nodeID := b.cluster.NodeID()
-		if err := b.cluster.AcquireSession(ctx, clientID, nodeID); err != nil {
-			b.logError("cluster_acquire_session", err, slog.String("client_id", clientID))
-		}
-	}
+	b.sessionsMap.Set(clientID, s)
+	sessionReady = true
 
 	return s, true, nil
 }
@@ -261,6 +280,16 @@ func (b *Broker) destroySessionLocked(ctx context.Context, s *session.Session) e
 
 // handleDisconnect handles session disconnect.
 func (b *Broker) handleDisconnect(s *session.Session, graceful bool) {
+	b.sessionLocks.Lock(s.ID)
+	defer b.sessionLocks.Unlock(s.ID)
+
+	// Disconnect callbacks run asynchronously. A clean reconnect can replace
+	// the session before the old callback starts; that stale callback must not
+	// delete or persist state belonging to the replacement session.
+	if b.sessionsMap.Get(s.ID) != s {
+		return
+	}
+
 	if b.auth != nil {
 		b.auth.Forget(s.ID)
 	}
@@ -318,17 +347,7 @@ func (b *Broker) handleDisconnect(s *session.Session, graceful bool) {
 	}
 
 	if s.CleanStart && s.ExpiryInterval == 0 {
-		b.sessionLocks.Lock(s.ID)
 		b.destroySessionLocked(context.Background(), s) //nolint:errcheck // best-effort session cleanup for clean-start sessions
-		b.sessionLocks.Unlock(s.ID)
-
-		// Release ownership for clean sessions
-		if b.cluster != nil {
-			ctx := context.Background()
-			if err := b.cluster.ReleaseSession(ctx, s.ID); err != nil {
-				b.logError("cluster_release_session", err, slog.String("client_id", s.ID))
-			}
-		}
 	}
 	// For persistent sessions, DON'T release ownership immediately
 	// Keep ownership so messages can still be routed to this node
